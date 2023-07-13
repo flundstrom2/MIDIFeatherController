@@ -20,33 +20,43 @@ import time
 import random
 import adafruit_midi
 
+from adafruit_midi.midi_message import MIDIMessage
 from adafruit_midi.note_on import NoteOn
 from adafruit_midi.note_off import NoteOff
 from adafruit_midi.pitch_bend import PitchBend
 from adafruit_midi.control_change import ControlChange
+from adafruit_midi.channel_pressure import ChannelPressure
+
+from cedargrove_midi_tools import note_to_name, cc_code_to_description
 
 print("\n\n==================\n" + board_id + "\n")
 
 MIDI_BAUDRATE = const(31250)
 
-WIDTH   = const(128)
-HEIGHT  = const(32)
-CHR_W   = const(5+1)
-CHR_H   = const(8)
+WIDTH   		= const(128)
+HEIGHT  		= const(32)
+CHR_W   		= const(5+1)
+CHR_H   		= const(8)
 CHARS_PER_LINE  = (WIDTH / CHR_W)# 21.3
-nBUT_DOWN   = const(0)
-nBUT_UP     = const(1)
+LR_FMT 			= "{}{:<" + str(CHARS_PER_LINE-1-4) + 				       "}{:>3}"
+NOTE_FMT 		= "{}{:<" + str(CHARS_PER_LINE-1-5-4) + 			 "} Vel: {:>3}"
+NOTE_PRS_FMT	= "{}{:<" + str(CHARS_PER_LINE-1-3-4-5-4) + "} P: {:>3} Vel: {:>3}"
+MSG_MISSED		= "!"
+MSG_NOT_MISSED	= " "
+MSG_NONE		= ""
+nBUT_DOWN   	= const(0)
+nBUT_UP	 		= const(1)
 
-MLVL_DEV    = const(1)
-MLVL_BANK   = const(2)
-MLVL_ITEM   = const(3)
-MLVL_SHOW   = const(4)
+MLVL_DEV		= const(1)
+MLVL_BANK   	= const(2)
+MLVL_ITEM   	= const(3)
+MLVL_SHOW   	= const(4)
 
-LEVEL_TOP   = const(MLVL_DEV)
-LEVEL_BOT   = const(MLVL_SHOW)
+LEVEL_TOP   	= const(MLVL_DEV)
+LEVEL_BOT   	= const(MLVL_SHOW)
 
-COLOR_BLK   = const(0)
-COLOR_BY    = const(1)
+COLOR_BLK   	= const(0)
+COLOR_BY		= const(1)
 
 # For Feather M0 Express, Metro M0 Express, Metro M4 Express, Circuit Playground Express, QT Py M0
 #import neopixel
@@ -88,10 +98,10 @@ i2c.try_lock()
 lst = i2c.scan()
 print("len=" + str(len(lst)))
 if len(lst) > 0:
-    addr = lst[0]
-    print("addr=" + hex(addr))
+	addr = lst[0]
+	print("addr=" + hex(addr))
 else:
-    print("I2C slave not found!")
+	print("I2C slave not found!")
 i2c.unlock()
 
 # Create the SSD1306 OLED class from FrameBuf.
@@ -122,6 +132,7 @@ do_clear = clear_next
 str_dev = "Dev???"
 str_bank = "Bank???"
 str_item = "Item ???"
+midi_message_str = ""
 
 level = LEVEL_TOP
 index = 1
@@ -131,97 +142,198 @@ midi_devices = ("Roland TD-3", "Volca Keys", "Microfreak", "Cobalt 8M")
 midi_channels = (10, 1, 3, 4)
 current_device = index-1
 current_bank = index-1
-current_midi_channel = 1
+selected_channel = 0
+
+last_cc = -1
+last_cc_name = ""
+last_cc_value = 0
+last_note = -1
+last_note_name = ""
+last_velocity = 0
+last_pressure = 0
+update_midi = 0
+do_clear = 0
+
+
+
+def refreshDisplay(update_midi_row, clear_now, clear_next):
+	refresh = 0
+	
+	if update_midi_row:
+		if clear_now:
+			display.fill_rect(		 0, 0, WIDTH,	4*CHR_H, COLOR_BLK)
+		else:
+			display.fill_rect( 0, CHR_H*3, WIDTH,	1*CHR_H, COLOR_BLK)
+
+	elif clear_now:
+		display.fill_rect(			 0, 0, WIDTH,	3*CHR_H, COLOR_BLK)
+
+	if clear_now:
+		if level >= MLVL_SHOW:
+			display.text(str_dev,		0,			0*CHR_H, COLOR_BY)
+			display.text(str_item,		0,			1*CHR_H, COLOR_BY, size=2)
+		else:
+			if level >= MLVL_DEV:
+				display.text(str_dev,   0,			0*CHR_H, COLOR_BY)
+			if level >= MLVL_BANK:
+				display.text(str_bank,  0,			1*CHR_H, COLOR_BY)
+			if level >= MLVL_ITEM:
+				display.text(str_item,  0,			2*CHR_H, COLOR_BY)
+		refresh = 1
+		clear_next = 0
+
+	if update_midi_row:
+		display.text(midi_message_str,  0,			3*CHR_H, COLOR_BY)
+		refresh = 1
+		
+	if refresh:
+		refresh = 0
+		display.show()		
+
+	return clear_next
+
+
 
 while True:
-    if level == MLVL_DEV:
-        index_max = 4
+	if level == MLVL_DEV:
+		index_max = 4
 
-        if index > index_max:
-            index = 1
-            clear_next = 1
+		if index > index_max:
+			index = 1
+			clear_next = 1
 
-        if index-1  < len(midi_devices):
-            current_device = index-1
-            current_midi_channel = midi_channels[current_device]
-            if current_midi_channel < 10:
-                ch = " " + str(current_midi_channel)
-            else:
-                ch = "" + str(current_midi_channel)
-            str_dev = "T" + str(index) + " Ch " + ch + ": " + midi_devices[current_device]
+		if clear_next:
+			if index-1  < len(midi_devices):
+				current_device = index-1
+				selected_channel = midi_channels[current_device]-1
+				if selected_channel < 10-1:
+					ch = " " + str(selected_channel+1)
+				else:
+					ch = "" + str(selected_channel+1)
+				str_dev = "T" + str(index) + " Ch " + ch + ": " + midi_devices[current_device]
 
-    elif level == MLVL_BANK:
-        index_max = 128
+	elif level == MLVL_BANK:
+		index_max = 128
 
-        if index > index_max:
-            index = 1
-            clear_next = 1
+		if index > index_max:
+			index = 1
+			clear_next = 1
 
-        current_bank = index-1
-        str_bank = "Bank " + str(current_bank)
+		if clear_next:
+			current_bank = index-1
+			str_bank = "Bank " + str(current_bank)
 
-    elif level == MLVL_ITEM:
-        index_max = 3
+	elif level == MLVL_ITEM:
+		index_max = 3
 
-        if index > index_max:
-            index = 1
-            clear_next = 1
+		if index > index_max:
+			index = 1
+			clear_next = 1
 
-        if index == 1:
-            str_item = "ITEM 0"
-        elif index == 2:
-            str_item = "ITEM 1"
-        elif index == 3:
-            str_item = "SEND MIDI"
+		if clear_next:
+			if index == 1:
+				str_item = "ITEM 0"
+			elif index == 2:
+				str_item = "ITEM 1"
+			elif index == 3:
+				str_item = "SEND MIDI"
 
-    do_clear = clear_next	
+	do_clear = clear_next
 
-    but_can_db.update()
-    but_l_db.update()
-    but_r_db.update()
-    but_ok_db.update()
+	but_can_db.update()
+	but_l_db.update()
+	but_r_db.update()
+	but_ok_db.update()
 
-    if but_can_db.fell:
-        if level > LEVEL_TOP:
-            level = level -1
-            clear_next = 1
+	if but_can_db.fell:
+		if level > LEVEL_TOP:
+			level = level -1
+			clear_next = 1
+			do_clear = 0
 
-    if but_l_db.fell:
-        if index > 1:
-            index = index -1
-            clear_next = 1
+	elif but_l_db.fell:
+		if index > 1:
+			index = index -1
+			clear_next = 1
+			do_clear = 0
 
-    elif but_r_db.fell:
-        if index < index_max:
-            index = index +1
-            clear_next = 1
+	elif but_r_db.fell:
+		if index < index_max:
+			index = index +1
+			clear_next = 1
+			do_clear = 0
 
-    elif but_ok_db.fell:
-        if level < LEVEL_BOT:
-            level = level +1
-            index = 1
-            clear_next = 1
+	elif but_ok_db.fell:
+		if level < LEVEL_BOT:
+			level = level +1
+			index = 1
+			clear_next = 1
+			do_clear = 0
 
-    if do_clear:
-        display.fill_rect(              0, 0, WIDTH,    3*CHR_H, COLOR_BLK)
-        if level >= MLVL_SHOW:
-            display.text(str_dev,       0,              0*CHR_H, COLOR_BY)
-            display.text(str_item,      0,              1*CHR_H, COLOR_BY, size=2)
-        else:
-            if level >= MLVL_DEV:
-                display.text(str_dev,   0,              0*CHR_H, COLOR_BY)
-            if level >= MLVL_BANK:
-                display.text(str_bank,  0,              1*CHR_H, COLOR_BY)
-            if level >= MLVL_ITEM:
-                display.text(str_item,  0,              2*CHR_H, COLOR_BY)
-        display.show()
-        clear_next = 0
+	if clear_next and not do_clear:
+		midi_message_str = MSG_NONE
+		
+	clear_next = refreshDisplay(update_midi, do_clear, clear_next)
+	update_midi = 0
+	
+	if not clear_next:
+		missed_messages = -1
+		handle_message = None
+		next_midi_message = midi.receive()
+		# midi_message = next_midi_message
+		while next_midi_message:
+			midi_message = next_midi_message
+			next_midi_message = midi.receive()
+			if midi_message.channel == selected_channel:
+				missed_messages = missed_messages +1
+				handle_message = midi_message
+			
 
-    if not clear_next:
-        midi_message = midi.receive()
-        while midi_message:
-            print("MIDI: " + str(midi_message))
-            midi_message = midi.receive()
+		
+		if handle_message != None:
+			midi_message = handle_message
+			if missed_messages > 0:
+				missed = MSG_MISSED
+			else:
+				missed = MSG_NOT_MISSED
+
+			if isinstance(midi_message, NoteOn):
+				if last_note != midi_message.note:
+					last_note = midi_message.note
+					last_note_name = note_to_name(last_note)
+					
+				last_velocity = midi_message.velocity
+				midi_message_str = NOTE_FMT.format(missed, last_note_name, last_velocity)
+				update_midi = 1
+			
+			elif isinstance(midi_message, ChannelPressure):
+				last_pressure = midi_message.pressure
+				midi_message_str = NOTE_PRS_FMT.format(missed, last_note_name, last_pressure, last_velocity)
+				update_midi = 1
+
+			elif isinstance(midi_message, NoteOff):
+				if last_note != midi_message.note:
+					last_note = midi_message.note
+					last_note_name = note_to_name(last_note)
+					
+				midi_message_str = NOTE_FMT.format(missed, last_note_name, "---")
+				update_midi = 1
+				
+			elif isinstance(midi_message, ControlChange):
+				if last_cc != midi_message.control:
+					last_cc = midi_message.control
+					last_cc_name = cc_code_to_description(last_cc)
+					
+				last_cc_value = midi_message.value
+				midi_message_str = LR_FMT.format(missed, last_cc_name, last_cc_value)
+				update_midi = 1
+					
+	if midi_message_str is MSG_NONE:
+		update_midi = 1
+			
+
+
+
 
 
 def sendMidi():
