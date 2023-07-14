@@ -6,7 +6,6 @@ from board import SCL, SDA, A2, A3, A4, A5, board_id, TX, RX
 from busio import I2C, UART
 from digitalio import DigitalInOut, Direction, Pull
 from adafruit_debouncer import Debouncer
-from time import sleep
 
 # Import the SSD1306 module (Framebuf)
 import adafruit_ssd1306
@@ -16,8 +15,6 @@ import displayio
 import adafruit_displayio_ssd1306
 
 # Import MIDI stuff
-import time
-import random
 import adafruit_midi
 
 from adafruit_midi.midi_message import MIDIMessage
@@ -29,15 +26,21 @@ from adafruit_midi.channel_pressure import ChannelPressure
 
 from cedargrove_midi_tools import note_to_name, cc_code_to_description
 
+
+# And other stuff
+import time
+import random
+
+
 print("\n\n==================\n" + board_id + "\n")
 
-MIDI_BAUDRATE = const(31250)
+MIDI_BAUDRATE	= const(31250)
 
 WIDTH   		= const(128)
 HEIGHT  		= const(32)
 CHR_W   		= const(5+1)
 CHR_H   		= const(8)
-CHARS_PER_LINE  = (WIDTH / CHR_W)# 21.3
+CHARS_PER_LINE  = WIDTH / CHR_W		# 21.3
 LR_FMT 			= "{}{:<" + str(CHARS_PER_LINE-1-4) + 				       "}{:>3}"
 NOTE_FMT 		= "{}{:<" + str(CHARS_PER_LINE-1-5-4) + 			 "} Vel: {:>3}"
 NOTE_PRS_FMT	= "{}{:<" + str(CHARS_PER_LINE-1-3-4-5-4) + "} P: {:>3} Vel: {:>3}"
@@ -51,6 +54,8 @@ MLVL_DEV		= const(1)
 MLVL_BANK   	= const(2)
 MLVL_ITEM   	= const(3)
 MLVL_SHOW   	= const(4)
+
+MAX_BANKS		= const(128)
 
 LEVEL_TOP   	= const(MLVL_DEV)
 LEVEL_BOT   	= const(MLVL_SHOW)
@@ -121,27 +126,34 @@ display.show()
 
 
 # Configure MIDI
-midiuart = UART(TX, RX, baudrate=MIDI_BAUDRATE, timeout= 0.001)
+midiuart = UART(TX, RX, baudrate=MIDI_BAUDRATE, timeout=0.001)
 midi = adafruit_midi.MIDI(midi_out=midiuart, midi_in=midiuart, out_channel=10)
 
 print("Default output MIDI channel:", midi.out_channel + 1)
 
+midi_devices = ("Roland TD-3", "Volca Keys", "Microfreak", "Cobalt 8M")
+midi_channels = (10, 1, 3, 4)
+selected_banks = []
 
-clear_next = 1
-do_clear = clear_next
-str_dev = "Dev???"
-str_bank = "Bank???"
-str_item = "Item ???"
+selected_banks.append(7)
+selected_banks.append(9)
+selected_banks.append(3)
+selected_banks.append(17)
+
+
+NUM_DEVICES = len(midi_devices)
+
+str_dev = ""
+str_bank = ""
+str_item = ""
 midi_message_str = ""
 
 level = LEVEL_TOP
-index = 1
+index = 0
 index_max = 0
 
-midi_devices = ("Roland TD-3", "Volca Keys", "Microfreak", "Cobalt 8M")
-midi_channels = (10, 1, 3, 4)
-current_device = index-1
-current_bank = index-1
+current_device = index
+current_bank = index
 selected_channel = 0
 
 last_cc = -1
@@ -151,13 +163,14 @@ last_note = -1
 last_note_name = ""
 last_velocity = 0
 last_pressure = 0
-update_midi = 0
-do_clear = 0
+update_midi = False
+do_clear = False
+clear_next = True
 
 
 
 def refreshDisplay(update_midi_row, clear_now, clear_next):
-	refresh = 0
+	refresh = False
 	
 	if update_midi_row:
 		if clear_now:
@@ -179,63 +192,60 @@ def refreshDisplay(update_midi_row, clear_now, clear_next):
 				display.text(str_bank,  0,			1*CHR_H, COLOR_BY)
 			if level >= MLVL_ITEM:
 				display.text(str_item,  0,			2*CHR_H, COLOR_BY)
-		refresh = 1
-		clear_next = 0
+		refresh = True
+		clear_next = False
 
 	if update_midi_row:
 		display.text(midi_message_str,  0,			3*CHR_H, COLOR_BY)
-		refresh = 1
+		refresh = True
 		
 	if refresh:
-		refresh = 0
+		refresh = False
 		display.show()		
 
 	return clear_next
 
 
 
+
 while True:
 	if level == MLVL_DEV:
-		index_max = 4
+		index_max = NUM_DEVICES
 
-		if index > index_max:
-			index = 1
-			clear_next = 1
+		if index >= index_max:
+			index = 0
+			clear_next = True
 
 		if clear_next:
-			if index-1  < len(midi_devices):
-				current_device = index-1
-				selected_channel = midi_channels[current_device]-1
-				if selected_channel < 10-1:
-					ch = " " + str(selected_channel+1)
-				else:
-					ch = "" + str(selected_channel+1)
-				str_dev = "T" + str(index) + " Ch " + ch + ": " + midi_devices[current_device]
+			if index < NUM_DEVICES:
+				current_device = index
+				selected_channel = midi_channels[current_device]
+				str_dev = "T{} Ch {:>2}: {}".format(index, selected_channel, midi_devices[current_device])
+				selected_channel -= 1	# Keep 0-aligned henceforth
 
 	elif level == MLVL_BANK:
-		index_max = 128
+		index_max = MAX_BANKS
 
-		if index > index_max:
-			index = 1
-			clear_next = 1
+		if index >= index_max:
+			index = 0
+			clear_next = True
 
-		if clear_next:
-			current_bank = index-1
-			str_bank = "Bank " + str(current_bank)
+		if clear_next:			
+			str_bank = "Bank {}".format(index)
 
 	elif level == MLVL_ITEM:
 		index_max = 3
 
-		if index > index_max:
-			index = 1
-			clear_next = 1
+		if index >= index_max:
+			index = 0
+			clear_next = True
 
 		if clear_next:
-			if index == 1:
+			if index == 0:
 				str_item = "ITEM 0"
-			elif index == 2:
+			elif index == 1:
 				str_item = "ITEM 1"
-			elif index == 3:
+			elif index == 2:
 				str_item = "SEND MIDI"
 
 	do_clear = clear_next
@@ -245,36 +255,62 @@ while True:
 	but_r_db.update()
 	but_ok_db.update()
 
+
 	if but_can_db.fell:
+		if level == MLVL_DEV:
+			index = 0
+			
+		elif level == MLVL_BANK:
+			index = current_device
+			
+		elif level == MLVL_ITEM:
+			index = selected_banks[current_device]
+			
+		elif level == MLVL_SHOW:
+			index = index
+
+
 		if level > LEVEL_TOP:
-			level = level -1
-			clear_next = 1
-			do_clear = 0
+			level -= 1
+			clear_next = True
+			do_clear = False
 
 	elif but_l_db.fell:
-		if index > 1:
-			index = index -1
-			clear_next = 1
-			do_clear = 0
+		if index > 0:
+			index -= 1
+			clear_next = True
+			do_clear = False
 
 	elif but_r_db.fell:
-		if index < index_max:
-			index = index +1
-			clear_next = 1
-			do_clear = 0
+		if index < index_max-1:
+			index += 1
+			clear_next = True
+			do_clear = False
 
 	elif but_ok_db.fell:
+		if level == MLVL_DEV:
+			index = selected_banks[current_device]
+			
+		elif level == MLVL_BANK:
+			selected_banks[current_device] = index
+			
+		elif level == MLVL_ITEM:
+			index = index
+
+		else:
+			index = 0
+
+
 		if level < LEVEL_BOT:
-			level = level +1
-			index = 1
-			clear_next = 1
-			do_clear = 0
+			level += 1
+			clear_next = True
+			do_clear = False
 
 	if clear_next and not do_clear:
 		midi_message_str = MSG_NONE
 		
 	clear_next = refreshDisplay(update_midi, do_clear, clear_next)
-	update_midi = 0
+	update_midi = False
 	
 	if not clear_next:
 		missed_messages = -1
@@ -284,13 +320,14 @@ while True:
 		while next_midi_message:
 			midi_message = next_midi_message
 			next_midi_message = midi.receive()
+			dropped_messages += 1
 			if midi_message.channel == selected_channel:
-				missed_messages = missed_messages +1
+				missed_messages += 1
 				handle_message = midi_message
 			
 
 		
-		if handle_message != None:
+		if handle_message  != None:
 			midi_message = handle_message
 			if missed_messages > 0:
 				missed = MSG_MISSED
@@ -304,12 +341,12 @@ while True:
 					
 				last_velocity = midi_message.velocity
 				midi_message_str = NOTE_FMT.format(missed, last_note_name, last_velocity)
-				update_midi = 1
+				update_midi = True
 			
 			elif isinstance(midi_message, ChannelPressure):
 				last_pressure = midi_message.pressure
 				midi_message_str = NOTE_PRS_FMT.format(missed, last_note_name, last_pressure, last_velocity)
-				update_midi = 1
+				update_midi = True
 
 			elif isinstance(midi_message, NoteOff):
 				if last_note != midi_message.note:
@@ -317,7 +354,7 @@ while True:
 					last_note_name = note_to_name(last_note)
 					
 				midi_message_str = NOTE_FMT.format(missed, last_note_name, "---")
-				update_midi = 1
+				update_midi = True
 				
 			elif isinstance(midi_message, ControlChange):
 				if last_cc != midi_message.control:
@@ -326,10 +363,10 @@ while True:
 					
 				last_cc_value = midi_message.value
 				midi_message_str = LR_FMT.format(missed, last_cc_name, last_cc_value)
-				update_midi = 1
+				update_midi = True
 					
 	if midi_message_str is MSG_NONE:
-		update_midi = 1
+		update_midi = True
 			
 
 
