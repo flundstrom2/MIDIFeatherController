@@ -14,6 +14,7 @@ import adafruit_ssd1306
 import displayio
 import adafruit_displayio_ssd1306
 
+
 # Import MIDI stuff
 import adafruit_midi
 
@@ -23,6 +24,14 @@ from adafruit_midi.note_off import NoteOff
 from adafruit_midi.pitch_bend import PitchBend
 from adafruit_midi.control_change import ControlChange
 from adafruit_midi.channel_pressure import ChannelPressure
+from adafruit_midi.timing_clock import TimingClock
+from adafruit_midi.system_exclusive import SystemExclusive
+from adafruit_midi.start import Start
+from adafruit_midi.stop import Stop
+from adafruit_midi.midi_continue import Continue
+from adafruit_midi.program_change import ProgramChange
+from adafruit_midi.polyphonic_key_pressure import PolyphonicKeyPressure
+from adafruit_midi.mtc_quarter_frame import MtcQuarterFrame
 
 from cedargrove_midi_tools import note_to_name, cc_code_to_description
 
@@ -30,17 +39,42 @@ from cedargrove_midi_tools import note_to_name, cc_code_to_description
 # And other stuff
 import time
 import random
+from supervisor import ticks_ms
+
+_TICKS_PERIOD = const(1<<29)
+_TICKS_MAX = const(_TICKS_PERIOD-1)
+_TICKS_HALFPERIOD = const(_TICKS_PERIOD//2)
+
+def ticks_add(ticks, delta):
+    "Add a delta to a base number of ticks, performing wraparound at 2**29ms."
+    return (ticks + delta) % _TICKS_PERIOD
+
+def ticks_diff(ticks1, ticks2):
+    "Compute the signed difference between two ticks values, assuming that they are within 2**28 ticks"
+    diff = (ticks1 - ticks2) & _TICKS_MAX
+    diff = ((diff + _TICKS_HALFPERIOD) & _TICKS_MAX) - _TICKS_HALFPERIOD
+    return diff
+
+def ticks_less(ticks1, ticks2):
+    "Return true iff ticks1 is less than ticks2, assuming that they are within 2**28 ticks"
+    return ticks_diff(ticks1, ticks2) < 0
+
+
 
 
 print("\n\n==================\n" + board_id + "\n")
 
+
 MIDI_BAUDRATE	= const(31250)
+I2C_FREQUENCY	= const(1_000_000)
 
 WIDTH   		= const(128)
 HEIGHT  		= const(32)
+
 CHR_W   		= const(5+1)
 CHR_H   		= const(8)
-CHARS_PER_LINE  = WIDTH / CHR_W		# 21.3
+
+CHARS_PER_LINE  = const(WIDTH // CHR_W)		# 21.3
 LR_FMT 			= "{}{:<" + str(CHARS_PER_LINE-1-4) + 				       "}{:>3}"
 NOTE_FMT 		= "{}{:<" + str(CHARS_PER_LINE-1-5-4) + 			 "} Vel: {:>3}"
 NOTE_PRS_FMT	= "{}{:<" + str(CHARS_PER_LINE-1-3-4-5-4) + "} P: {:>3} Vel: {:>3}"
@@ -50,18 +84,30 @@ MSG_NONE		= ""
 nBUT_DOWN   	= const(0)
 nBUT_UP	 		= const(1)
 
-MLVL_DEV		= const(1)
-MLVL_BANK   	= const(2)
-MLVL_ITEM   	= const(3)
-MLVL_SHOW   	= const(4)
+LEVEL_DEV		= const(1)
+LEVEL_ACTION	= const(2)
+LEVEL_BANK   	= const(3)
+LEVEL_ITEM   	= const(4)
+LEVEL_SHOW   	= const(5)
 
-MAX_BANKS		= const(128)
-
-LEVEL_TOP   	= const(MLVL_DEV)
-LEVEL_BOT   	= const(MLVL_SHOW)
+LEVEL_TOP   	= const(LEVEL_DEV)
+LEVEL_BOT   	= const(LEVEL_SHOW)
 
 COLOR_BLK   	= const(0)
 COLOR_BY		= const(1)
+
+
+# Executable Actions
+ACT_NONE			= const(-1)	# When selecting action
+ACT_PROGRAM_CHANGE	= const(0)
+ACT_SHOW_MIDI		= const(1)
+
+action				= (ACT_PROGRAM_CHANGE,	ACT_SHOW_MIDI)
+action_str			= ("Program Change",	"Show MIDI")
+
+NUM_ACTIONS			= len(action)
+assert 				  len(action_str) == NUM_ACTIONS
+
 
 # For Feather M0 Express, Metro M0 Express, Metro M4 Express, Circuit Playground Express, QT Py M0
 #import neopixel
@@ -98,7 +144,7 @@ but_ok_db = Debouncer(but_ok)
 
 addr = 0x3C  # Default I2C address unless otherwise found
 # Create the I2C interface.
-i2c = I2C(SCL, SDA, frequency=400_000)
+i2c = I2C(SCL, SDA, frequency=I2C_FREQUENCY)
 i2c.try_lock()
 lst = i2c.scan()
 print("len=" + str(len(lst)))
@@ -131,30 +177,42 @@ midi = adafruit_midi.MIDI(midi_out=midiuart, midi_in=midiuart, out_channel=10)
 
 print("Default output MIDI channel:", midi.out_channel + 1)
 
-midi_devices = ("Roland TD-3", "Volca Keys", "Microfreak", "Cobalt 8M")
-midi_channels = (10, 1, 3, 4)
-selected_banks = []
 
-selected_banks.append(7)
-selected_banks.append(9)
+# MIDI Devices (hard-coded)
+midi_devices	= ("Roland TD-3",	"Volca Keys",	"Microfreak",	"Cobalt 8M")
+midi_channels	= (10,				1,				3, 				4)
+max_banks 		= (1,				1,				7,				2)
+selected_banks	= []
+
+selected_banks.append(0)
+selected_banks.append(0)
 selected_banks.append(3)
-selected_banks.append(17)
+selected_banks.append(1)
 
 
-NUM_DEVICES = len(midi_devices)
+NUM_DEVICES 	= len(midi_devices)
+assert			  len(midi_channels) == NUM_DEVICES
+
+
+# And variables
+
 
 str_dev = ""
+str_action = ""
 str_bank = ""
 str_item = ""
-midi_message_str = ""
+str_status = ""
 
 level = LEVEL_TOP
 index = 0
 index_max = 0
 
-current_device = index
-current_bank = index
-selected_channel = 0
+current_device		= 0
+current_action		= 0
+current_bank		= 0
+
+selected_channel	= 0
+selected_action		= ACT_NONE
 
 last_cc = -1
 last_cc_name = ""
@@ -163,40 +221,45 @@ last_note = -1
 last_note_name = ""
 last_velocity = 0
 last_pressure = 0
-update_midi = False
+clear_status_row = False
 do_clear = False
 clear_next = True
 
 
-
-def refreshDisplay(update_midi_row, clear_now, clear_next):
+def refreshDisplay(update_status_row, clear_now, clear_next):
 	refresh = False
 	
-	if update_midi_row:
+	if update_status_row:
 		if clear_now:
-			display.fill_rect(		 0, 0, WIDTH,	4*CHR_H, COLOR_BLK)
+			display.fill_rect(	0, 			0, WIDTH,	4*CHR_H, COLOR_BLK)
 		else:
-			display.fill_rect( 0, CHR_H*3, WIDTH,	1*CHR_H, COLOR_BLK)
+			display.fill_rect(	0,    CHR_H*3, WIDTH,	1*CHR_H, COLOR_BLK)
 
 	elif clear_now:
-		display.fill_rect(			 0, 0, WIDTH,	3*CHR_H, COLOR_BLK)
+		display.fill_rect(		 0, 		0, WIDTH,	3*CHR_H, COLOR_BLK)
 
 	if clear_now:
-		if level >= MLVL_SHOW:
-			display.text(str_dev,		0,			0*CHR_H, COLOR_BY)
-			display.text(str_item,		0,			1*CHR_H, COLOR_BY, size=2)
-		else:
-			if level >= MLVL_DEV:
-				display.text(str_dev,   0,			0*CHR_H, COLOR_BY)
-			if level >= MLVL_BANK:
-				display.text(str_bank,  0,			1*CHR_H, COLOR_BY)
-			if level >= MLVL_ITEM:
-				display.text(str_item,  0,			2*CHR_H, COLOR_BY)
+		if level >= LEVEL_SHOW:
+			display.text(str_dev,			0,			0*CHR_H, COLOR_BY)
+			display.text(str_action,		0,			1*CHR_H, COLOR_BY)
+			display.text(str_item,			0,			2*CHR_H, COLOR_BY, size=2)
+		else:		
+			if level >= LEVEL_DEV:
+				display.text(str_dev,		0,			0*CHR_H, COLOR_BY)
+
+			if level >= LEVEL_ACTION:
+				display.text(str_action,	0,			1*CHR_H, COLOR_BY)
+			if level >= LEVEL_BANK:
+				display.text(str_bank,		0,			2*CHR_H, COLOR_BY)
+			if level >= LEVEL_ITEM:
+				display.text(str_item,		0,			3*CHR_H, COLOR_BY)
+				update_status_row = False
+					
 		refresh = True
 		clear_next = False
 
-	if update_midi_row:
-		display.text(midi_message_str,  0,			3*CHR_H, COLOR_BY)
+	if update_status_row:
+		display.text(str_status,  			0,			3*CHR_H, COLOR_BY)
 		refresh = True
 		
 	if refresh:
@@ -206,10 +269,17 @@ def refreshDisplay(update_midi_row, clear_now, clear_next):
 	return clear_next
 
 
+def forwardMessage(m):
+	midi.send(m, m.channel)
+	
+	
 
+now = ticks_ms()
+then = ticks_add(now, 1000)
+ignored_messages = 0
 
 while True:
-	if level == MLVL_DEV:
+	if level == LEVEL_DEV:
 		index_max = NUM_DEVICES
 
 		if index >= index_max:
@@ -223,30 +293,63 @@ while True:
 				str_dev = "T{} Ch {:>2}: {}".format(index, selected_channel, midi_devices[current_device])
 				selected_channel -= 1	# Keep 0-aligned henceforth
 
-	elif level == MLVL_BANK:
-		index_max = MAX_BANKS
+	elif selected_action == ACT_NONE:
+		if level == LEVEL_ACTION:
+			index_max = NUM_ACTIONS
 
-		if index >= index_max:
-			index = 0
-			clear_next = True
+			if index >= index_max:
+				index = 0
+				clear_next = True
 
-		if clear_next:			
-			str_bank = "Bank {}".format(index)
+			if clear_next:
+				if index < NUM_ACTIONS:
+					current_action = index
+					str_action = action_str[current_action]					
+		
+	elif selected_action == ACT_PROGRAM_CHANGE:
+		if level == LEVEL_ACTION:
+			index_max = NUM_ACTIONS
+			
+		elif level == LEVEL_BANK:			
+			index_max = max_banks[current_device]
 
-	elif level == MLVL_ITEM:
-		index_max = 3
+			if index >= index_max:
+				index = 0
+				clear_next = True
 
-		if index >= index_max:
-			index = 0
-			clear_next = True
+			if clear_next:			
+				str_bank = "Bank {}".format(index)
+				
+		elif level == LEVEL_ITEM:
+			index_max = 3
 
-		if clear_next:
-			if index == 0:
-				str_item = "ITEM 0"
-			elif index == 1:
-				str_item = "ITEM 1"
-			elif index == 2:
-				str_item = "SEND MIDI"
+			if index >= index_max:
+				index = 0
+				clear_next = True
+
+			if clear_next:
+				if index == 0:
+					str_item = "ITEM 0"
+				elif index == 1:
+					str_item = "ITEM 1"
+				elif index == 2:
+					str_item = "ITEM 3"
+					
+	elif selected_action == ACT_SHOW_MIDI:
+		if level == LEVEL_ACTION:
+			index_max = NUM_ACTIONS
+			
+			if index >= index_max:
+				index = 0
+				clear_next = True
+
+			if clear_next:
+				if index < NUM_ACTIONS:
+					current_action = index
+					str_action = action_str[current_action]					
+	
+			
+
 
 	do_clear = clear_next
 
@@ -257,60 +360,118 @@ while True:
 
 
 	if but_can_db.fell:
-		if level == MLVL_DEV:
+		print("CAN   at level: {} index: {} selected_action: {}".format(level, index, selected_action))
+		
+		if level == LEVEL_DEV:
 			index = 0
+			index_max = NUM_ACTIONS
+			current_device = 0
+			clear_next = True
+			do_clear = False
 			
-		elif level == MLVL_BANK:
+		elif level == LEVEL_ACTION:
+			index = current_device
+
+		elif level == LEVEL_BANK:
 			index = current_device
 			
-		elif level == MLVL_ITEM:
+		elif level == LEVEL_ITEM:
 			index = selected_banks[current_device]
 			
-		elif level == MLVL_SHOW:
-			index = index
+		elif level == LEVEL_SHOW:
+			str_status = MSG_NONE
 
 
 		if level > LEVEL_TOP:
 			level -= 1
 			clear_next = True
 			do_clear = False
+			clear_status_row = True
+
 
 	elif but_l_db.fell:
+		print("LEFT  at level: {} index: {} selected_action: {}".format(level, index, selected_action))
 		if index > 0:
 			index -= 1
 			clear_next = True
 			do_clear = False
+			clear_status_row = False
+		print("LEFT -> level: {} index: {} selected_action: {} clear_status_row: {} clear_next: {} do_clear: {}".format(
+			level, index, selected_action, clear_status_row, clear_next, do_clear))
+			
 
 	elif but_r_db.fell:
-		if index < index_max-1:
+		print("RIGHT at level: {} index: {} selected_action: {}".format(level, index, selected_action))
+		if index < index_max:
 			index += 1
 			clear_next = True
 			do_clear = False
+			clear_status_row = False
+		print("RIGHT -> level: {} index: {} selected_action: {} clear_status_row: {} clear_next: {} do_clear: {}".format(
+			level, index, selected_action, clear_status_row, clear_next, do_clear))
 
 	elif but_ok_db.fell:
-		if level == MLVL_DEV:
-			index = selected_banks[current_device]
+		print("OK    at level: {} index: {} selected_action: {}".format(level, index, selected_action))
+		if level == LEVEL_DEV:
+			level = LEVEL_ACTION
+			index = 0
+			index_max = NUM_ACTIONS
+			current_action = 0
+			clear_next = True
+			do_clear = False
 			
-		elif level == MLVL_BANK:
-			selected_banks[current_device] = index
+		elif level >= LEVEL_ACTION:
+			if level == LEVEL_ACTION:
+				selected_action = action[current_action]
 			
-		elif level == MLVL_ITEM:
-			index = index
+			if selected_action == ACT_PROGRAM_CHANGE:
+				if level == LEVEL_ACTION:
+					level = LEVEL_BANK
+					index = selected_banks[current_device]
+					
+					
+				elif level == LEVEL_BANK:
+					selected_banks[current_device] = index
+					level = LEVEL_ITEM
+					index = 0
+					
+				elif level == LEVEL_ITEM:
+					level = LEVEL_SHOW
+					str_status = MSG_NONE
+
+					
+				elif level == LEVEL_SHOW:
+					pass
+					
+				else:
+					assert False, "Invalid level {} for selected_action {}".format(level, selected_action)
+					
+				clear_next = True
+				do_clear = False
+				clear_status_row = True
+					
+			elif selected_action == ACT_SHOW_MIDI:
+				if level == LEVEL_ACTION:
+					str_bank = MSG_NONE
+					str_item = MSG_NONE
+					str_status = NOTE_FMT.format(" ", "---", "---")
+					clear_next = True
+					do_clear = False
+					clear_status_row = True
 
 		else:
 			index = 0
+			
+		print("OK    -> level: {} index: {} selected_action: {} clear_status_row: {} clear_next: {} do_clear: {}".format(
+			level, index, selected_action, clear_status_row, clear_next, do_clear))
 
 
-		if level < LEVEL_BOT:
-			level += 1
-			clear_next = True
-			do_clear = False
 
-	if clear_next and not do_clear:
-		midi_message_str = MSG_NONE
+	if clear_next and not do_clear and not clear_status_row:
+		str_status = MSG_NONE
 		
-	clear_next = refreshDisplay(update_midi, do_clear, clear_next)
-	update_midi = False
+	clear_next = refreshDisplay(clear_status_row, do_clear, clear_next)
+	clear_status_row = False
 	
 	if not clear_next:
 		missed_messages = -1
@@ -318,16 +479,26 @@ while True:
 		next_midi_message = midi.receive()
 		# midi_message = next_midi_message
 		while next_midi_message:
-			midi_message = next_midi_message
-			next_midi_message = midi.receive()
-			dropped_messages += 1
-			if midi_message.channel == selected_channel:
-				missed_messages += 1
-				handle_message = midi_message
+			forwardMessage(next_midi_message)
+		
+			if isinstance(next_midi_message, TimingClock):
+				next_midi_message = midi.receive()
+				
+			else:
+				midi_message = next_midi_message
+				next_midi_message = midi.receive()
+				if next_midi_message and not isinstance(next_midi_message, TimingClock):
+					ignored_messages += 1
+					# print(midi_message)
+					
+				if midi_message.channel == selected_channel:
+					missed_messages += 1
+					handle_message = midi_message
+			
 			
 
 		
-		if handle_message  != None:
+		if handle_message != None and selected_action == ACT_SHOW_MIDI:
 			midi_message = handle_message
 			if missed_messages > 0:
 				missed = MSG_MISSED
@@ -340,21 +511,21 @@ while True:
 					last_note_name = note_to_name(last_note)
 					
 				last_velocity = midi_message.velocity
-				midi_message_str = NOTE_FMT.format(missed, last_note_name, last_velocity)
-				update_midi = True
+				str_status = NOTE_FMT.format(missed, last_note_name, last_velocity)
+				clear_status_row = True
 			
 			elif isinstance(midi_message, ChannelPressure):
 				last_pressure = midi_message.pressure
-				midi_message_str = NOTE_PRS_FMT.format(missed, last_note_name, last_pressure, last_velocity)
-				update_midi = True
+				str_status = NOTE_PRS_FMT.format(missed, last_note_name, last_pressure, last_velocity)
+				clear_status_row = True
 
 			elif isinstance(midi_message, NoteOff):
 				if last_note != midi_message.note:
 					last_note = midi_message.note
 					last_note_name = note_to_name(last_note)
 					
-				midi_message_str = NOTE_FMT.format(missed, last_note_name, "---")
-				update_midi = True
+				str_status = NOTE_FMT.format(missed, last_note_name, "---")
+				clear_status_row = True
 				
 			elif isinstance(midi_message, ControlChange):
 				if last_cc != midi_message.control:
@@ -362,12 +533,21 @@ while True:
 					last_cc_name = cc_code_to_description(last_cc)
 					
 				last_cc_value = midi_message.value
-				midi_message_str = LR_FMT.format(missed, last_cc_name, last_cc_value)
-				update_midi = True
+				str_status = LR_FMT.format(missed, last_cc_name, last_cc_value)
+				clear_status_row = True
+				
+			else:
+				print(midi_message)
 					
-	if midi_message_str is MSG_NONE:
-		update_midi = True
+	if str_status is MSG_NONE and selected_action == ACT_SHOW_MIDI:
+		clear_status_row = True
 			
+	now = ticks_ms()
+	if ticks_diff(now, then) > 0:
+		then = ticks_add(now, 1000)
+		if ignored_messages:
+			print("MIDI messages ignored: {}".format(ignored_messages))
+			ignored_messages = 0
 
 
 
@@ -385,4 +565,3 @@ def sendMidi():
 	print("Sending NoteOff G#2 + CC3(44)")
 	midi.send([NoteOff("G#2", 120),
 			   ControlChange(3, 44)])
-
